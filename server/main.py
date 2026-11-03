@@ -120,6 +120,30 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    total_cost: float
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[RestockingOrderItem]
+    total_value: float
+    status: str
+    order_date: str
+    expected_delivery: str
+    budget: float
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    budget: float
+
+# In-memory store for restocking orders (cleared on restart)
+restocking_orders: List[dict] = []
+
 # API endpoints
 @app.get("/")
 def root():
@@ -303,6 +327,77 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(budget: float = 50000):
+    """Return demand-forecast items ranked by forecasted demand, enriched with unit_cost from inventory."""
+    # Build a SKU -> unit_cost lookup from inventory
+    sku_cost = {item["sku"]: item["unit_cost"] for item in inventory_items}
+    sku_name_inv = {item["sku"]: item["name"] for item in inventory_items}
+
+    recommendations = []
+    for forecast in demand_forecasts:
+        sku = forecast["item_sku"]
+        unit_cost = sku_cost.get(sku)
+        # Skip items with no matching inventory entry or zero cost — can't price them
+        if unit_cost is None or unit_cost <= 0:
+            continue
+        # Suggest restocking enough to cover the forecasted demand gap
+        quantity = max(1, forecast["forecasted_demand"] - forecast["current_demand"])
+        total_cost = round(quantity * unit_cost, 2)
+        recommendations.append({
+            "sku": sku,
+            "name": sku_name_inv.get(sku, forecast["item_name"]),
+            "forecasted_demand": forecast["forecasted_demand"],
+            "current_demand": forecast["current_demand"],
+            "trend": forecast["trend"],
+            "quantity": quantity,
+            "unit_cost": unit_cost,
+            "total_cost": total_cost,
+        })
+
+    # Sort by forecasted demand descending so highest-demand items fill the budget first
+    recommendations.sort(key=lambda x: x["forecasted_demand"], reverse=True)
+
+    # Greedily select items that fit within the budget
+    selected, remaining = [], budget
+    for rec in recommendations:
+        if rec["total_cost"] <= remaining:
+            selected.append(rec)
+            remaining -= rec["total_cost"]
+
+    return {"recommendations": selected, "all_items": recommendations, "budget": budget, "remaining": round(remaining, 2)}
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """Return all submitted restocking orders."""
+    return restocking_orders
+
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder)
+def create_restocking_order(request: CreateRestockingOrderRequest):
+    """Submit a restocking order. Delivery is fixed at 7 days from today."""
+    from datetime import datetime, timedelta
+    import uuid
+
+    order_date = datetime.now()
+    expected_delivery = order_date + timedelta(days=7)
+    total_value = round(sum(item.total_cost for item in request.items), 2)
+
+    order = {
+        "id": str(uuid.uuid4()),
+        "order_number": f"RST-{len(restocking_orders) + 1:04d}",
+        "items": [item.dict() for item in request.items],
+        "total_value": total_value,
+        "status": "Processing",
+        "order_date": order_date.strftime("%Y-%m-%d"),
+        "expected_delivery": expected_delivery.strftime("%Y-%m-%d"),
+        "budget": request.budget,
+    }
+    restocking_orders.append(order)
+    return order
+
 
 if __name__ == "__main__":
     import uvicorn
